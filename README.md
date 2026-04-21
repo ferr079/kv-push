@@ -9,7 +9,7 @@ Runs every 5 minutes via systemd timer, collecting metrics from multiple sources
 - **Status KV**: service availability (HTTP checks, TCP checks, Proxmox node status)
 - **Stats KV**: infrastructure metrics (LXC count, HTTPS services, commits, flags, etc.)
 
-## Metrics collected (14)
+## Metrics collected (15)
 
 | Metric | Source |
 |---|---|
@@ -25,6 +25,7 @@ Runs every 5 minutes via systemd timer, collecting metrics from multiple sources
 | `beszel_agents` | Beszel SQLite DB |
 | `htb_flags` | HackTheBox API activity feed |
 | `rootme_score` | Root-Me API |
+| `blog_articles` | Forgejo API (content listing) |
 
 ## Setup
 
