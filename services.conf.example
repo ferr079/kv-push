@@ -1,0 +1,26 @@
+# kv-push — service definitions
+# One service per line:  name|url|category
+#
+#   url        http(s)://…  → status-code check (2xx-6xx counts as answering)
+#              tcp://host:port → TCP port check, for anything without HTTP
+#   category   free-form label your dashboard groups by (infra, apps,
+#              monitoring, storage…)
+#
+# Lines starting with # and blank lines are ignored.
+
+Reverse proxy|https://traefik.example.lab|infra
+DNS|http://10.0.0.10:5380|infra
+Internal CA|https://10.0.0.11:443/health|infra
+Forge|https://forge.example.lab|infra
+SSO|https://sso.example.lab|infra
+
+Wiki|https://wiki.example.lab|apps
+Media|https://media.example.lab|apps
+Notes|http://10.0.0.30:22300|apps
+
+Metrics|https://metrics.example.lab|monitoring
+Logs|http://10.0.0.40:3100/ready|monitoring
+SIEM|https://siem.example.lab|monitoring
+
+Backup server|https://10.0.0.50:8007|storage
+File share|tcp://10.0.0.51:445|storage
