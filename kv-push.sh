@@ -1,58 +1,47 @@
 #!/bin/bash
 # kv-push.sh — Push homelab status & stats to Cloudflare KV
-# Runs every 5 min via systemd timer on CT 192 (OpenFang)
-# Secrets in /opt/openfang/scripts/kv-push.env (EnvironmentFile)
+#
+# Reads its whole configuration from the environment (see kv-push.env.example)
+# and a services file, so this script can be dropped on any host without edits.
+#
+#   set -a; source /etc/kv-push/kv-push.env; set +a
+#   ./kv-push.sh
+#
+# Every optional collector is skipped when its variables are unset: what cannot
+# be measured is omitted from the payload rather than published as a stale
+# constant — a dashboard showing nothing beats a dashboard showing a lie.
 
 set -euo pipefail
 
-CF_ACCOUNT="c14f021007b64942165602a76b258b97"
-STATUS_NS="52300c6bc4a548af882ee63b6422a471"
-STATS_NS="299a7b4537b049649736e23b84753a6a"
+# --- Required configuration ---------------------------------------------------
+: "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID is required}"
+: "${CF_API_TOKEN:?CF_API_TOKEN is required (scoped token, not the Global API Key)}"
+: "${CF_STATUS_NAMESPACE_ID:?CF_STATUS_NAMESPACE_ID is required}"
+: "${CF_STATS_NAMESPACE_ID:?CF_STATS_NAMESPACE_ID is required}"
+
+SERVICES_FILE="${SERVICES_FILE:-/etc/kv-push/services.conf}"
+TIMEOUT="${CHECK_TIMEOUT:-5}"
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# --- Service definitions: name|url|category ---
-# Format: name|url_or_tcp|category
-# TCP checks use tcp://host:port format
-SERVICES=(
-  "Traefik|https://traefik.pixelium.internal|infra"
-  "TechnitiumDNS|http://192.168.1.100:5380|infra"
-  "TechnitiumDNS 2|http://192.168.1.101:5380|infra"
-  "step-ca|https://192.168.1.102:443/health|infra"
-  "Headscale|tcp://192.168.1.106:22|infra"
-  "Authentik|https://authentik.pixelium.internal|infra"
-  "Forgejo|https://forgejo.pixelium.internal|infra"
-  "Forgejo Runner|tcp://192.168.1.178:22|infra"
-  "NetBox|https://netbox.pixelium.internal|infra"
-  "netboot.xyz|http://192.168.1.188:80|infra"
-  "Homepage|https://homepage.pixelium.internal|apps"
-  "Vaultwarden|https://vaultwarden.pixelium.internal|apps"
-  "Jellyfin|https://jellyfin.pixelium.internal|apps"
-  "Immich|https://immich.pixelium.internal|apps"
-  "Kavita|https://kavita.pixelium.internal|apps"
-  "FreshRSS|https://freshrss.pixelium.internal|apps"
-  "The Lounge|https://the-lounge.pixelium.internal|apps"
-  "Linkwarden|https://linkwarden.pixelium.internal|apps"
-  "ByteStash|https://bytestash.pixelium.internal|apps"
-  "draw.io|https://drawio.pixelium.internal|apps"
-  "Excalidraw|https://excalidraw.pixelium.internal|apps"
-  "Joplin Server|http://192.168.1.170:22300|apps"
-  "Semaphore|https://semaphore.pixelium.internal|apps"
-  "OpenFang|tcp://127.0.0.1:22|apps"
-  "IronClaw|http://192.168.1.190:3000|apps"
-  "Mosquitto MQTT|tcp://192.168.1.142:1883|infra"
-  "Home Assistant|https://homeassistant.pixelium.internal|infra"
-  "Wiki.js Infra|https://wikinfra.pixelium.internal|apps"
-  "Beszel|https://beszel.pixelium.internal|monitoring"
-  "Wazuh|https://wazuh.pixelium.internal|monitoring"
-  "VictoriaMetrics|https://victoriametrics.pixelium.internal|monitoring"
-  "Patchmon|https://patchmon.pixelium.internal|monitoring"
-  "Loki|http://192.168.1.240:3100/ready|monitoring"
-  "PBS|https://192.168.1.150:8007|storage"
-  "share2|tcp://192.168.1.104:445|storage"
-  "APT Cache|http://192.168.1.200:3142|storage"
-)
+CF_API="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces"
 
-# --- Ping services ---
+# --- Service definitions ------------------------------------------------------
+# One service per line in $SERVICES_FILE: name|url|category
+# URLs may be http(s):// for a status-code check, or tcp://host:port for a port
+# check. Lines starting with # and blank lines are ignored.
+#
+#   Forgejo|https://forgejo.example.lab|infra
+#   Postgres|tcp://10.0.0.20:5432|storage
+
+if [ ! -r "$SERVICES_FILE" ]; then
+  echo "kv-push: services file not found: $SERVICES_FILE" >&2
+  echo "kv-push: copy services.conf.example and adapt it" >&2
+  exit 1
+fi
+
+mapfile -t SERVICES < <(grep -vE '^\s*(#|$)' "$SERVICES_FILE")
+
+# --- Ping services ------------------------------------------------------------
 up=0
 down=0
 json_services=""
@@ -63,16 +52,15 @@ for svc in "${SERVICES[@]}"; do
   is_up=false
 
   if [[ "$url" == tcp://* ]]; then
-    # TCP port check
     hostport="${url#tcp://}"
     host="${hostport%%:*}"
     port="${hostport##*:}"
-    if timeout 3 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+    if timeout "$TIMEOUT" bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
       is_up=true
     fi
   else
-    # HTTP(S) check
-    http_code=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+    http_code=$(curl -sk --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+    # 2xx-6xx: the service answered. Only a connection failure counts as down.
     if [[ "$http_code" =~ ^[23456] ]]; then
       is_up=true
     fi
@@ -88,236 +76,259 @@ for svc in "${SERVICES[@]}"; do
   fi
 done
 
-# Remove trailing comma
 json_services="${json_services%,}"
 total=$((up + down))
 
-# --- Proxmox node metrics ---
+# --- Proxmox nodes ------------------------------------------------------------
+# PVE_NODES holds one "name|host|api_token" per line:
+#   PVE_NODES="pve1|10.0.0.11|user@pam!kvpush=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#   pve2|10.0.0.12|user@pam!kvpush=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
 json_nodes=""
+node_count=0
+lxc_count=0
+lxc_seen=false
 
-for node_info in "pve1|192.168.1.251|${PVE1_TOKEN:-}" "pve2|192.168.1.252|${PVE2_TOKEN:-}" "pve3|192.168.1.253|${PVE3_TOKEN:-}"; do
-  IFS='|' read -r nname nip ntoken <<< "$node_info"
+if [ -n "${PVE_NODES:-}" ]; then
+  while IFS='|' read -r nname nhost ntoken; do
+    [ -z "${nname:-}" ] && continue
+    node_count=$((node_count + 1))
 
-  node_data=$(curl -sk --max-time 5 \
-    "https://${nip}:8006/api2/json/nodes/${nname}/status" \
-    -H "Authorization: PVEAPIToken=${ntoken}" 2>/dev/null || echo "")
+    node_data=$(curl -sk --max-time "$TIMEOUT" \
+      "https://${nhost}:8006/api2/json/nodes/${nname}/status" \
+      -H "Authorization: PVEAPIToken=${ntoken}" 2>/dev/null || echo "")
 
-  cpu=$(echo "$node_data" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(round(d['cpu']*100))" 2>/dev/null || echo "")
+    cpu=$(echo "$node_data" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(round(d['cpu']*100))" 2>/dev/null || echo "")
 
-  if [ -n "$cpu" ]; then
-    ram_used=$(echo "$node_data" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(round(d['memory']['used']/d['memory']['total']*100))" 2>/dev/null || echo "0")
-    uptime_days=$(echo "$node_data" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(round(d['uptime']/86400))" 2>/dev/null || echo "0")
-    json_nodes+='{"name":"'"$nname"'","cpu":'"$cpu"',"ram":'"$ram_used"',"uptime_days":'"$uptime_days"'},'
-  else
-    # Node unreachable (off or no token)
-    json_nodes+='{"name":"'"$nname"'","status":"offline"},'
-  fi
-done
-# Remove trailing comma
+    if [ -n "$cpu" ]; then
+      ram_used=$(echo "$node_data" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(round(d['memory']['used']/d['memory']['total']*100))" 2>/dev/null || echo "0")
+      uptime_days=$(echo "$node_data" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(round(d['uptime']/86400))" 2>/dev/null || echo "0")
+      json_nodes+='{"name":"'"$nname"'","cpu":'"$cpu"',"ram":'"$ram_used"',"uptime_days":'"$uptime_days"'},'
+
+      count=$(curl -sk --max-time "$TIMEOUT" \
+        "https://${nhost}:8006/api2/json/nodes/${nname}/lxc" \
+        -H "Authorization: PVEAPIToken=${ntoken}" 2>/dev/null | \
+        python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "")
+      if [ -n "$count" ]; then
+        lxc_count=$((lxc_count + count))
+        lxc_seen=true
+      fi
+    else
+      # Unreachable: powered off (on-demand node), no token, or genuinely down.
+      json_nodes+='{"name":"'"$nname"'","status":"offline"},'
+    fi
+  done <<< "$PVE_NODES"
+fi
+
 json_nodes="${json_nodes%,}"
 
-# --- Count HTTPS services (from SERVICES array) ---
+# --- Count HTTPS-exposed services ---------------------------------------------
 https_count=0
 for svc in "${SERVICES[@]}"; do
   IFS='|' read -r _name url _cat <<< "$svc"
   [[ "$url" == https://* ]] && https_count=$((https_count + 1))
 done
 
-# --- Count LXC containers (from Proxmox API) ---
-lxc_count=0
-for node_info in "pve1|192.168.1.251|${PVE1_TOKEN:-}" "pve2|192.168.1.252|${PVE2_TOKEN:-}" "pve3|192.168.1.253|${PVE3_TOKEN:-}"; do
-  IFS='|' read -r nname nip ntoken <<< "$node_info"
-  count=$(curl -sk --max-time 5 \
-    "https://${nip}:8006/api2/json/nodes/${nname}/lxc" \
-    -H "Authorization: PVEAPIToken=${ntoken}" 2>/dev/null | \
-    python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "0")
-  lxc_count=$((lxc_count + count))
-done
-# pve3 has 3 CTs — add statically if pve3 was unreachable (count was 0 from API)
-if ! echo "$json_nodes" | grep -q '"pve3","cpu"'; then
-  lxc_count=$((lxc_count + 3))
-fi
-
-# --- Ansible playbooks count (from Semaphore API) ---
-ansible_playbooks=$(curl -sk --max-time 5 \
-  "https://semaphore.pixelium.internal/api/project/1/templates" \
-  -H "Authorization: Bearer ${SEMAPHORE_TOKEN:-}" 2>/dev/null | \
-  python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "14")
-
-# --- Ansible hosts count (from inventory on Semaphore CT 202) ---
-ansible_hosts=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@192.168.1.202 \
-  "grep -c ansible_host /opt/semaphore/tmp/project_1/repository_1_template_2/inventories/hosts.yml" 2>/dev/null || echo "34")
-
-# --- Beszel agents count (from PocketBase on CT 230) ---
-beszel_agents=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@192.168.1.230 \
-  "sqlite3 /opt/beszel/beszel_data/data.db 'SELECT COUNT(*) FROM systems'" 2>/dev/null || echo "30")
-
-# --- Compute uptime percentage (simple: up/total * 100) ---
+# --- Uptime percentage --------------------------------------------------------
 if [ "$total" -gt 0 ]; then
   uptime_pct=$(python3 -c "print(round($up/$total*100, 1))")
 else
   uptime_pct="0"
 fi
 
-# --- Push STATUS_KV ---
+# --- Push STATUS_KV -----------------------------------------------------------
+# DRY_RUN=1 prints the payloads instead of writing them, so a run can be
+# inspected before it touches the dashboard.
+kv_put() {
+  local namespace="$1" key="$2" payload="$3"
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    printf '%s → %s\n%s\n\n' "$namespace" "$key" "$payload"
+    return
+  fi
+  curl -s -X PUT \
+    "${CF_API}/${namespace}/values/${key}" \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$payload" > /dev/null
+}
+
 status_payload='{"ok":true,"services":['"$json_services"'],"nodes":['"$json_nodes"'],"summary":{"total":'"$total"',"up":'"$up"',"down":'"$down"',"uptime_pct":'"$uptime_pct"'},"updated_at":"'"$TIMESTAMP"'"}'
 
-curl -s -X PUT \
-  "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/storage/kv/namespaces/${STATUS_NS}/values/services" \
-  -H "X-Auth-Email: ${CF_EMAIL}" \
-  -H "X-Auth-Key: ${CF_KEY}" \
-  -H "Content-Type: application/json" \
-  -d "$status_payload" > /dev/null
+kv_put "$CF_STATUS_NAMESPACE_ID" "${CF_STATUS_KEY:-services}" "$status_payload"
 
-# --- Push STATS_KV ---
-# Forgejo commits (last 30 days) — own repos only (exclude mirrors), paginated
-SINCE_DATE=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-commits_30d=$(SINCE="$SINCE_DATE" TOKEN="$FORGEJO_TOKEN" python3 << 'PYEOF'
+# --- Optional collectors ------------------------------------------------------
+# Each one prints nothing when it cannot measure; empty values are dropped from
+# the stats payload below instead of being replaced by a hardcoded fallback.
+
+# Forgejo: commits over the last 30 days and all-time, own repos only
+commits_30d=""
+commits_total=""
+if [ -n "${FORGEJO_URL:-}" ] && [ -n "${FORGEJO_TOKEN:-}" ]; then
+  SINCE_DATE=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+  read -r commits_30d commits_total <<< "$(
+    SINCE="$SINCE_DATE" TOKEN="$FORGEJO_TOKEN" BASE="$FORGEJO_URL" \
+    VERIFY="${FORGEJO_TLS_VERIFY:-1}" python3 << 'PYEOF' || true
 import urllib.request, json, ssl, os
 ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
+if os.environ.get("VERIFY") != "1":
+    # Internal CA not trusted by this host: opt-in only, never the default.
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
 token = os.environ["TOKEN"]
-since = os.environ["SINCE"]
-base = "https://forgejo.pixelium.internal/api/v1"
-total = 0
+since = os.environ.get("SINCE", "")
+base = os.environ["BASE"].rstrip("/") + "/api/v1"
+recent = alltime = 0
 try:
-    req = urllib.request.Request(f"{base}/repos/search?limit=50&token={token}")
-    repos = json.loads(urllib.request.urlopen(req, context=ctx).read()).get("data", [])
-    for r in repos:
-        if r.get("mirror", False):
-            continue
-        owner = r["owner"]["login"]
-        name = r["name"]
-        branch = r.get("default_branch", "main")
-        page = 1
-        while page <= 20:
-            try:
-                url = f"{base}/repos/{owner}/{name}/commits?sha={branch}&since={since}&limit=50&page={page}&token={token}"
-                commits = json.loads(urllib.request.urlopen(urllib.request.Request(url), context=ctx).read())
-                count = len(commits) if isinstance(commits, list) else 0
-                total += count
-                if count < 50:
-                    break
-                page += 1
-            except:
-                break
-    print(total)
-except: print(0)
-PYEOF
-)
-
-# Forgejo total commits (all-time, own repos) — via x-total-count header
-commits_total=$(TOKEN="$FORGEJO_TOKEN" python3 << 'PYTEOF'
-import urllib.request, json, ssl, os
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-token = os.environ["TOKEN"]
-base = "https://forgejo.pixelium.internal/api/v1"
-total = 0
-try:
-    req = urllib.request.Request(f"{base}/repos/search?limit=50&token={token}")
-    repos = json.loads(urllib.request.urlopen(req, context=ctx).read()).get("data", [])
+    req = urllib.request.Request(f"{base}/repos/search?limit=50", headers={"Authorization": f"token {token}"})
+    repos = json.loads(urllib.request.urlopen(req, context=ctx, timeout=15).read()).get("data", [])
     for r in repos:
         if r.get("mirror", False):
             continue
         owner, name = r["owner"]["login"], r["name"]
+        branch = r.get("default_branch", "main")
         try:
-            url = f"{base}/repos/{owner}/{name}/commits?limit=1&token={token}"
-            res = urllib.request.urlopen(urllib.request.Request(url), context=ctx)
-            count = int(res.headers.get("x-total-count", 0))
-            total += count
-        except: pass
-    print(total)
-except: print(0)
-PYTEOF
-)
-
-# --- HTB stats (profile + activity feed) ---
-read htb_flags htb_rank htb_ranking htb_system_owns htb_user_owns <<< $(TOKEN="${HTB_API_TOKEN:-}" python3 << 'HTBEOF'
-import urllib.request, json, os
-token = os.environ.get("TOKEN", "")
-if not token:
-    print("95 Hacker 972 24 26")
-    raise SystemExit
-headers = {"Authorization": f"Bearer {token}", "User-Agent": "kv-push/1.0"}
-flags, rank, ranking, sys_owns, usr_owns = 95, "Hacker", 972, 24, 26
-try:
-    req = urllib.request.Request("https://labs.hackthebox.com/api/v4/user/profile/basic/1161145", headers=headers)
-    d = json.loads(urllib.request.urlopen(req, timeout=10).read())
-    p = d.get("profile", {})
-    rank = p.get("rank", rank)
-    ranking = p.get("ranking", ranking)
-    sys_owns = p.get("system_owns", sys_owns)
-    usr_owns = p.get("user_owns", usr_owns)
-except: pass
-try:
-    req = urllib.request.Request("https://labs.hackthebox.com/api/v4/user/profile/activity/1161145", headers=headers)
-    d = json.loads(urllib.request.urlopen(req, timeout=10).read())
-    flags = len(d.get("profile", {}).get("activity", []))
-except: pass
-print(f"{flags} {rank} {ranking} {sys_owns} {usr_owns}")
-HTBEOF
-)
-
-# --- Root-Me score (from API) ---
-rootme_score=$(ROOTME_UID="${ROOTME_UID:-}" ROOTME_KEY="${ROOTME_API_KEY:-}" python3 << 'RMEOF'
-import urllib.request, json, os
-uid = os.environ.get("ROOTME_UID", "")
-key = os.environ.get("ROOTME_KEY", "")
-if not uid or not key:
-    print(765)
-    raise SystemExit
-try:
-    req = urllib.request.Request(f"https://api.www.root-me.org/auteurs/{uid}")
-    req.add_header("Cookie", f"api_key={key}")
-    d = json.loads(urllib.request.urlopen(req, timeout=10).read())
-    print(d.get("score", 765))
-except:
-    print(765)
-RMEOF
-)
-
-# Journal entries count (### headings in latest journal files)
-journal_entries=$(TOKEN="$FORGEJO_TOKEN" python3 << 'PYJEOF'
-import urllib.request, json, ssl, os
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-token = os.environ["TOKEN"]
-base = "https://forgejo.pixelium.internal/api/v1"
-total = 0
-try:
-    for month in ["2026-01", "2026-02", "2026-03", "2026-04"]:
-        url = f"{base}/repos/uzer/homelab-infra/raw/journal/{month}.md?token={token}"
-        try:
-            text = urllib.request.urlopen(urllib.request.Request(url), context=ctx).read().decode()
-            total += text.count("\n### ")
-        except: pass
-    print(total)
-except: print(0)
-PYJEOF
-)
-
-stats_payload='{"ok":true,"stats":{"services_up":'"$up"',"services_total":'"$total"',"uptime_pct":'"$uptime_pct"',"forgejo_commits_30d":'"$commits_30d"',"forgejo_commits_total":'"$commits_total"',"journal_entries":'"$journal_entries"',"proxmox_nodes":2,"htb_flags":'"$htb_flags"',"htb_rank":"'"$htb_rank"'","htb_ranking":'"$htb_ranking"',"htb_system_owns":'"$htb_system_owns"',"htb_user_owns":'"$htb_user_owns"',"rootme_score":'"$rootme_score"',"ansible_playbooks":'"$ansible_playbooks"',"lxc_count":'"$lxc_count"',"https_services":'"$https_count"',"ansible_hosts":'"$ansible_hosts"',"beszel_agents":'"$beszel_agents"'},"updated_at":"'"$TIMESTAMP"'"}'
-
-curl -s -X PUT \
-  "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/storage/kv/namespaces/${STATS_NS}/values/stats" \
-  -H "X-Auth-Email: ${CF_EMAIL}" \
-  -H "X-Auth-Key: ${CF_KEY}" \
-  -H "Content-Type: application/json" \
-  -d "$stats_payload" > /dev/null
-
-# --- Record history snapshot (D1, hourly dedup server-side) ---
-if [ -n "${HISTORY_KEY:-}" ]; then
-  history_res=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-    "https://pixelium.win/api/history/record" \
-    -H "X-History-Key: ${HISTORY_KEY}" \
-    -H "Content-Type: application/json" 2>/dev/null || echo "000")
-  history_msg=""
-  [ "$history_res" = "200" ] && history_msg=" — history OK"
-  [ "$history_res" = "401" ] && history_msg=" — history AUTH FAIL"
+            url = f"{base}/repos/{owner}/{name}/commits?limit=1"
+            res = urllib.request.urlopen(
+                urllib.request.Request(url, headers={"Authorization": f"token {token}"}), context=ctx, timeout=15)
+            alltime += int(res.headers.get("x-total-count", 0))
+        except Exception:
+            pass
+        if not since:
+            continue
+        page = 1
+        while page <= 20:
+            try:
+                url = f"{base}/repos/{owner}/{name}/commits?sha={branch}&since={since}&limit=50&page={page}"
+                commits = json.loads(urllib.request.urlopen(
+                    urllib.request.Request(url, headers={"Authorization": f"token {token}"}),
+                    context=ctx, timeout=15).read())
+                count = len(commits) if isinstance(commits, list) else 0
+                recent += count
+                if count < 50:
+                    break
+                page += 1
+            except Exception:
+                break
+    print(recent, alltime)
+except Exception:
+    pass
+PYEOF
+  )"
 fi
 
-echo "[$(date -u +%H:%M:%S)] KV push: ${up}/${total} UP (${uptime_pct}%) — ${down} down${history_msg:-}"
+# Hack The Box: flags = user owns + system owns.
+# The /activity endpoint was removed by HTB in 2026 — do not reintroduce it.
+htb_rank=""
+htb_ranking=""
+htb_system_owns=""
+htb_user_owns=""
+htb_flags=""
+if [ -n "${HTB_API_TOKEN:-}" ] && [ -n "${HTB_USER_ID:-}" ]; then
+  read -r htb_rank htb_ranking htb_system_owns htb_user_owns htb_flags <<< "$(
+    TOKEN="$HTB_API_TOKEN" UID_="$HTB_USER_ID" python3 << 'HTBEOF' || true
+import urllib.request, json, os
+token, uid = os.environ["TOKEN"], os.environ["UID_"]
+headers = {"Authorization": f"Bearer {token}", "User-Agent": "kv-push/2.0"}
+try:
+    req = urllib.request.Request(
+        f"https://labs.hackthebox.com/api/v4/user/profile/basic/{uid}", headers=headers)
+    p = json.loads(urllib.request.urlopen(req, timeout=10).read()).get("profile", {})
+    sys_owns, usr_owns = int(p.get("system_owns", 0)), int(p.get("user_owns", 0))
+    print(p.get("rank", ""), p.get("ranking", ""), sys_owns, usr_owns, sys_owns + usr_owns)
+except Exception:
+    pass
+HTBEOF
+  )"
+fi
+
+# Root-Me: the API throttles the default python-urllib agent with a 429,
+# so an explicit User-Agent is mandatory, not cosmetic.
+rootme_score=""
+if [ -n "${ROOTME_UID:-}" ] && [ -n "${ROOTME_API_KEY:-}" ]; then
+  rootme_score=$(
+    UID_="$ROOTME_UID" KEY="$ROOTME_API_KEY" python3 << 'RMEOF' || true
+import urllib.request, json, os
+uid, key = os.environ["UID_"], os.environ["KEY"]
+try:
+    req = urllib.request.Request(
+        f"https://api.www.root-me.org/auteurs/{uid}",
+        headers={"User-Agent": "kv-push/2.0", "Accept": "application/json"})
+    req.add_header("Cookie", f"api_key={key}")
+    d = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    score = d.get("score")
+    if score is not None:
+        print(score)
+except Exception:
+    pass
+RMEOF
+  )
+fi
+
+# Semaphore: number of Ansible job templates
+ansible_playbooks=""
+if [ -n "${SEMAPHORE_URL:-}" ] && [ -n "${SEMAPHORE_TOKEN:-}" ]; then
+  ansible_playbooks=$(curl -sk --max-time "$TIMEOUT" \
+    "${SEMAPHORE_URL%/}/api/project/${SEMAPHORE_PROJECT_ID:-1}/templates" \
+    -H "Authorization: Bearer ${SEMAPHORE_TOKEN}" 2>/dev/null | \
+    python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || true)
+fi
+
+# --- Push STATS_KV ------------------------------------------------------------
+stats_payload=$(
+  UP="$up" TOTAL="$total" UPTIME="$uptime_pct" HTTPS="$https_count" \
+  NODES="$node_count" LXC="$([ "$lxc_seen" = true ] && echo "$lxc_count")" \
+  C30="$commits_30d" CALL="$commits_total" \
+  HTB_RANK="$htb_rank" HTB_RANKING="$htb_ranking" HTB_SYS="$htb_system_owns" \
+  HTB_USR="$htb_user_owns" HTB_FLAGS="$htb_flags" ROOTME="$rootme_score" \
+  PLAYBOOKS="$ansible_playbooks" TS="$TIMESTAMP" python3 << 'JSONEOF'
+import json, os
+
+def num(key):
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+stats = {
+    "services_up": num("UP"),
+    "services_total": num("TOTAL"),
+    "uptime_pct": num("UPTIME"),
+    "https_services": num("HTTPS"),
+    "proxmox_nodes": num("NODES") or None,
+    "lxc_count": num("LXC"),
+    "forgejo_commits_30d": num("C30"),
+    "forgejo_commits_total": num("CALL"),
+    "htb_rank": os.environ.get("HTB_RANK") or None,
+    "htb_ranking": num("HTB_RANKING"),
+    "htb_system_owns": num("HTB_SYS"),
+    "htb_user_owns": num("HTB_USR"),
+    "htb_flags": num("HTB_FLAGS"),
+    "rootme_score": num("ROOTME"),
+    "ansible_playbooks": num("PLAYBOOKS"),
+}
+# Omit-on-failure: a key absent from the payload lets the consumer keep the last
+# known value, whereas a zero would overwrite it with a wrong one.
+stats = {k: v for k, v in stats.items() if v is not None}
+print(json.dumps({"ok": True, "stats": stats, "updated_at": os.environ["TS"]}))
+JSONEOF
+)
+
+kv_put "$CF_STATS_NAMESPACE_ID" "${CF_STATS_KEY:-stats}" "$stats_payload"
+
+# --- Optional: history snapshot endpoint --------------------------------------
+history_msg=""
+if [ -n "${HISTORY_URL:-}" ] && [ -n "${HISTORY_KEY:-}" ]; then
+  history_res=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$HISTORY_URL" \
+    -H "X-History-Key: ${HISTORY_KEY}" \
+    -H "Content-Type: application/json" 2>/dev/null || echo "000")
+  [ "$history_res" = "200" ] && history_msg=" — history OK"
+  [ "$history_res" != "200" ] && history_msg=" — history HTTP ${history_res}"
+fi
+
+echo "[$(date -u +%H:%M:%S)] KV push: ${up}/${total} UP (${uptime_pct}%) — ${down} down${history_msg}"
